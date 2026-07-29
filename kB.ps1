@@ -48,6 +48,10 @@ $DaysBack = 7
 # Media types to include in the analytics query (voice + digital)
 $MediaTypes = @("voice", "message", "email", "chat")
 
+# Debug / isolation switches
+$IncludeMediaFilter = $true    # set $false to test with ONLY the division filter
+$ShowRequestBody    = $true    # echoes the JSON body sent to the analytics query (set $false once working)
+
 # Output
 $OutputFolder = "C:\Temp\GenesysKB"
 $RunStamp     = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -140,7 +144,19 @@ function Invoke-GcApi {
                 # No suggestions / resource not found - treat as empty, not fatal
                 return $null
             }
+
+            # Surface the Genesys error body - it states the exact rejection reason
+            $errBody = ""
+            try {
+                if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                    $errBody = [string]$_.ErrorDetails.Message
+                }
+            } catch { $errBody = "" }
+
             Write-Warning ("API call failed [" + $status + "] " + $Method + " " + $Uri + " :: " + $_.Exception.Message)
+            if ($errBody -ne "") {
+                Write-Warning ("Genesys error body: " + $errBody)
+            }
             return $null
         }
     }
@@ -180,6 +196,26 @@ $headers = @{
     "Content-Type"  = "application/json"
 }
 Write-Host "Authenticated OK." -ForegroundColor Green
+
+# =============================================================================
+# 1b. VALIDATE DIVISION ID (most common cause of 400 on the analytics query)
+# =============================================================================
+$DivisionId = $DivisionId.Trim()
+$guidPattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+if ($DivisionId -notmatch $guidPattern) {
+    Write-Warning ("DivisionId '" + $DivisionId + "' is not a valid GUID. Here are the divisions visible to this OAuth client:")
+    $divList = Invoke-GcApi -Method "Get" -Uri ($ApiBase + "/api/v2/authorization/divisions?pageSize=100") -Headers $headers
+    if ($divList -and $divList.entities) {
+        foreach ($d in $divList.entities) {
+            Write-Host ("  " + [string]$d.id + "   " + [string]$d.name)
+        }
+    }
+    else {
+        Write-Warning "Could not list divisions (check 'authorization > division > view' permission). Get the ID from Admin > Directory > Divisions."
+    }
+    exit 1
+}
 
 # =============================================================================
 # 2. GET CONVERSATIONS FOR THE DIVISION (analytics details query, paged)
@@ -223,21 +259,28 @@ while ($true) {
     $queryBody.Remove("segmentFilters2")
 
     # Add media type filter as a segment filter (any of the listed media types)
-    $mediaPredicates = @()
-    foreach ($mt in $MediaTypes) {
-        $mediaPredicates += @{
-            type      = "dimension"
-            dimension = "mediaType"
-            operator  = "matches"
-            value     = $mt
+    if ($IncludeMediaFilter) {
+        $mediaPredicates = @()
+        foreach ($mt in $MediaTypes) {
+            $mediaPredicates += @{
+                type      = "dimension"
+                dimension = "mediaType"
+                operator  = "matches"
+                value     = $mt
+            }
         }
-    }
-    $queryBody.segmentFilters += @{
-        type       = "or"
-        predicates = $mediaPredicates
+        $queryBody.segmentFilters += @{
+            type       = "or"
+            predicates = $mediaPredicates
+        }
     }
 
     $jsonBody = $queryBody | ConvertTo-Json -Depth 10
+    if ($ShowRequestBody -and $pageNumber -eq 1) {
+        Write-Host "---- Analytics request body ----" -ForegroundColor DarkGray
+        Write-Host $jsonBody -ForegroundColor DarkGray
+        Write-Host "--------------------------------" -ForegroundColor DarkGray
+    }
 
     $page = Invoke-GcApi -Method "Post" -Uri ($ApiBase + "/api/v2/analytics/conversations/details/query") -Headers $headers -Body $jsonBody
     if (-not $page) {
@@ -466,4 +509,4 @@ $summaryRows |
 
 Write-Host ("Summary CSV written: " + $SummaryCsv) -ForegroundColor Green
 Write-Host ""
-Write-Host "Done. Articles with high TimesPresented but low AcceptanceRate are your rewrite candidates." -ForegroundColor Cyan
+Write-Host "Done. Articles with high TimesPresented but low Accepta
