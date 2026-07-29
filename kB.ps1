@@ -240,7 +240,7 @@ while ($true) {
             pageSize   = $pageSize
             pageNumber = $pageNumber
         }
-        segmentFilters = @(
+        conversationFilters = @(
             @{
                 type = "or"
                 predicates = @(
@@ -253,10 +253,7 @@ while ($true) {
                 )
             }
         )
-        segmentFilters2 = $null
     }
-    # Remove helper null key before serialising
-    $queryBody.Remove("segmentFilters2")
 
     # Add media type filter as a segment filter (any of the listed media types)
     if ($IncludeMediaFilter) {
@@ -269,10 +266,12 @@ while ($true) {
                 value     = $mt
             }
         }
-        $queryBody.segmentFilters += @{
-            type       = "or"
-            predicates = $mediaPredicates
-        }
+        $queryBody["segmentFilters"] = @(
+            @{
+                type       = "or"
+                predicates = $mediaPredicates
+            }
+        )
     }
 
     $jsonBody = $queryBody | ConvertTo-Json -Depth 10
@@ -509,4 +508,4 @@ $summaryRows |
 
 Write-Host ("Summary CSV written: " + $SummaryCsv) -ForegroundColor Green
 Write-Host ""
-Write-Host "Done. Articles with high TimesPresented but low Accepta
+Write-Host "Done. Articles with high TimesPresented but low AcceptanceRate are your rewrite candidates." -ForegroundColor Cyan
