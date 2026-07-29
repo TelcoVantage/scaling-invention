@@ -49,14 +49,18 @@ $DaysBack = 7
 $MediaTypes = @("voice", "message", "email", "chat")
 
 # Debug / isolation switches
-$IncludeMediaFilter = $true    # set $false to test with ONLY the division filter
-$ShowRequestBody    = $true    # echoes the JSON body sent to the analytics query (set $false once working)
+$IncludeMediaFilter       = $true   # set $false to test with ONLY the division filter
+$ShowRequestBody          = $false  # echoes the JSON body sent to the analytics query
+$OnlyCopilotConversations = $true   # only pull conversations where an agent assistant (Copilot) was present
+$DumpFirstSuggestion      = $true   # dumps the first raw non-empty suggestions response (schema check)
+$IncludeTranscriptContext = $true   # fetch S&TA transcripts for conversations that had KB suggestions
 
 # Output
-$OutputFolder = "C:\Temp\GenesysKB"
-$RunStamp     = Get-Date -Format "yyyyMMdd_HHmmss"
-$DetailCsv    = $OutputFolder + "\KnowledgeSuggestions_Detail_"  + $RunStamp + ".csv"
-$SummaryCsv   = $OutputFolder + "\KnowledgeSuggestions_Summary_" + $RunStamp + ".csv"
+$OutputFolder  = "C:\Temp\GenesysKB"
+$RunStamp      = Get-Date -Format "yyyyMMdd_HHmmss"
+$DetailCsv     = $OutputFolder + "\KnowledgeSuggestions_Detail_"     + $RunStamp + ".csv"
+$SummaryCsv    = $OutputFolder + "\KnowledgeSuggestions_Summary_"    + $RunStamp + ".csv"
+$TranscriptCsv = $OutputFolder + "\KnowledgeSuggestions_Transcript_" + $RunStamp + ".csv"
 
 # =============================================================================
 # CLM-SAFE BASE64 ENCODER (pure PowerShell, bit operators only)
@@ -256,6 +260,7 @@ while ($true) {
     }
 
     # Add media type filter as a segment filter (any of the listed media types)
+    $segFilters = @()
     if ($IncludeMediaFilter) {
         $mediaPredicates = @()
         foreach ($mt in $MediaTypes) {
@@ -266,12 +271,29 @@ while ($true) {
                 value     = $mt
             }
         }
-        $queryBody["segmentFilters"] = @(
-            @{
-                type       = "or"
-                predicates = $mediaPredicates
-            }
-        )
+        $segFilters += @{
+            type       = "or"
+            predicates = $mediaPredicates
+        }
+    }
+
+    # Only conversations where Agent Copilot / Agent Assist participated -
+    # avoids querying suggestions for thousands of conversations that never had it
+    if ($OnlyCopilotConversations) {
+        $segFilters += @{
+            type = "or"
+            predicates = @(
+                @{
+                    type      = "dimension"
+                    dimension = "agentAssistantId"
+                    operator  = "exists"
+                }
+            )
+        }
+    }
+
+    if ($segFilters.Count -gt 0) {
+        $queryBody["segmentFilters"] = $segFilters
     }
 
     $jsonBody = $queryBody | ConvertTo-Json -Depth 10
@@ -291,10 +313,18 @@ while ($true) {
     if ($page.conversations) {
         $count = @($page.conversations).Count
         foreach ($conv in $page.conversations) {
-            $queueId = ""
-            # Grab first queueId found across participants/sessions/segments (best effort)
+            $queueId    = ""
+            $custSessId = ""
+            $convMedia  = ""
             foreach ($p in $conv.participants) {
+                $purpose = ""
+                if ($p.purpose) { $purpose = [string]$p.purpose }
                 foreach ($s in $p.sessions) {
+                    if ($convMedia -eq "" -and $s.mediaType) { $convMedia = [string]$s.mediaType }
+                    # Customer-side session id doubles as communicationId for transcript retrieval
+                    if ($custSessId -eq "" -and ($purpose -eq "customer" -or $purpose -eq "external") -and $s.sessionId) {
+                        $custSessId = [string]$s.sessionId
+                    }
                     foreach ($seg in $s.segments) {
                         if ($seg.queueId -and $queueId -eq "") { $queueId = [string]$seg.queueId }
                     }
@@ -305,6 +335,8 @@ while ($true) {
                 ConversationStart = [string]$conv.conversationStart
                 ConversationEnd   = [string]$conv.conversationEnd
                 QueueId           = $queueId
+                MediaType         = $convMedia
+                CustomerSessionId = $custSessId
             }
         }
     }
@@ -332,6 +364,11 @@ if ($conversationList.Count -eq 0) {
 $detailRows   = @()
 $titleCache   = @{}    # documentId -> title (avoid repeat knowledge API lookups)
 $processed    = 0
+$statNoData   = 0      # 404 / null responses
+$statEmpty    = 0      # 200 but no entities
+$statHasData  = 0      # conversations that returned suggestion entities
+$statNonKb    = 0      # suggestion entities that were not knowledge-related
+$dumpedSample = $false
 
 foreach ($conv in $conversationList) {
     $processed++
@@ -341,18 +378,33 @@ foreach ($conv in $conversationList) {
 
     $sugUri = $ApiBase + "/api/v2/conversations/" + $conv.ConversationId + "/suggestions?pageSize=100"
     $sugResponse = Invoke-GcApi -Method "Get" -Uri $sugUri -Headers $headers
-    if (-not $sugResponse) { continue }
+    if (-not $sugResponse) { $statNoData++; continue }
 
     $entities = @()
     if ($sugResponse.entities) { $entities = @($sugResponse.entities) }
-    if ($entities.Count -eq 0) { continue }
+    if ($entities.Count -eq 0) { $statEmpty++; continue }
+
+    $statHasData++
+
+    # One-off raw dump so we can verify the actual schema in your org
+    if ($DumpFirstSuggestion -and (-not $dumpedSample)) {
+        Write-Host "---- RAW suggestions response (first non-empty) ----" -ForegroundColor Magenta
+        Write-Host ($sugResponse | ConvertTo-Json -Depth 12)
+        Write-Host "----------------------------------------------------" -ForegroundColor Magenta
+        $dumpedSample = $true
+    }
 
     foreach ($sug in $entities) {
         $sugType = ""
         if ($sug.type) { $sugType = [string]$sug.type }
 
-        # Only knowledge-related suggestions are relevant to the KB audit
-        if (($sugType -notlike "*Knowledge*") -and ($sugType -notlike "*knowledge*")) { continue }
+        # Knowledge-related if the type says so OR any knowledge payload property exists
+        $isKnowledge = $false
+        if ($sugType -like "*nowledge*") { $isKnowledge = $true }
+        if ($sug.knowledgeArticleSuggestion) { $isKnowledge = $true }
+        if ($sug.knowledgeSearchSuggestion)  { $isKnowledge = $true }
+        if ($sug.knowledge)                  { $isKnowledge = $true }
+        if (-not $isKnowledge) { $statNonKb++; continue }
 
         $state       = ""
         $confidence  = ""
@@ -361,9 +413,15 @@ foreach ($conv in $conversationList) {
         $docVersion  = ""
         $title       = ""
         $utterance   = ""
+        $sugTime     = ""
 
         if ($sug.state)      { $state      = [string]$sug.state }
         if ($sug.confidence) { $confidence = [string]$sug.confidence }
+
+        # When was the article surfaced - needed to line up with the transcript
+        if ($sug.dateCreated)      { $sugTime = [string]$sug.dateCreated }
+        elseif ($sug.timestamp)    { $sugTime = [string]$sug.timestamp }
+        elseif ($sug.dateModified) { $sugTime = [string]$sug.dateModified }
 
         # Knowledge article payload - schema-defensive extraction
         $k = $null
@@ -383,16 +441,17 @@ foreach ($conv in $conversationList) {
             if ($k.document -and $k.document.title) { $title = [string]$k.document.title }
             elseif ($k.title) { $title = [string]$k.title }
 
+            # The search query Copilot generated FROM the conversation = the "why"
             if ($k.query) { $utterance = [string]$k.query }
+            if ($utterance -eq "" -and $k.searchQuery) { $utterance = [string]$k.searchQuery }
         }
 
         # Triggering utterance / message that caused the suggestion (best effort)
         if ($utterance -eq "" -and $sug.triggeringMessage -and $sug.triggeringMessage.text) {
             $utterance = [string]$sug.triggeringMessage.text
         }
-        if ($utterance -eq "" -and $sug.utterance) {
-            $utterance = [string]$sug.utterance
-        }
+        if ($utterance -eq "" -and $sug.utterance) { $utterance = [string]$sug.utterance }
+        if ($utterance -eq "" -and $sug.query)     { $utterance = [string]$sug.query }
 
         # Title fallback via Knowledge API (cached per document)
         if ($title -eq "" -and $kbId -ne "" -and $docId -ne "") {
@@ -412,8 +471,10 @@ foreach ($conv in $conversationList) {
             ConversationId    = $conv.ConversationId
             ConversationStart = $conv.ConversationStart
             QueueId           = $conv.QueueId
+            MediaType         = $conv.MediaType
             SuggestionId      = [string]$sug.id
             SuggestionType    = $sugType
+            SuggestedAtUtc    = $sugTime
             State             = $state
             Confidence        = $confidence
             KnowledgeBaseId   = $kbId
@@ -425,10 +486,21 @@ foreach ($conv in $conversationList) {
     }
 }
 
+Write-Host ""
+Write-Host ("Suggestion endpoint results across " + $conversationList.Count + " conversations:") -ForegroundColor Cyan
+Write-Host ("  With suggestion data : " + $statHasData)
+Write-Host ("  200 but empty        : " + $statEmpty)
+Write-Host ("  404 / no data / error: " + $statNoData)
+Write-Host ("  Non-knowledge entries skipped: " + $statNonKb)
 Write-Host ("Knowledge suggestion rows collected: " + $detailRows.Count) -ForegroundColor Green
 
 if ($detailRows.Count -eq 0) {
-    Write-Host "No knowledge suggestions found for these conversations. Check that Agent Copilot is enabled on the relevant queues, the OAuth client has 'conversation > suggestion > view', and the interval is within suggestion retention." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Diagnosis guide:" -ForegroundColor Yellow
+    Write-Host " - Mostly 404/no data + warnings showing 403: OAuth client is missing 'conversation > suggestion > view' - add it to the role." -ForegroundColor Yellow
+    Write-Host " - Mostly 200-but-empty: suggestion data has likely aged out (short retention, similar to Copilot summaries ~10 days) - re-run with DaysBack = 2 or 3." -ForegroundColor Yellow
+    Write-Host " - Zero conversations found at all: your Copilot may be recorded under a different dimension - set OnlyCopilotConversations = `$false and retry." -ForegroundColor Yellow
+    Write-Host " - Non-knowledge entries skipped > 0 but rows = 0: only canned response/script suggestions fired - check Copilot rules and KB confidence threshold." -ForegroundColor Yellow
     exit 0
 }
 
@@ -436,10 +508,110 @@ if ($detailRows.Count -eq 0) {
 # 4. EXPORT DETAIL CSV (explicit column order for CLM property hashtables)
 # =============================================================================
 $detailRows |
-    Select-Object ConversationId, ConversationStart, QueueId, SuggestionId, SuggestionType, State, Confidence, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText |
+    Select-Object ConversationId, ConversationStart, QueueId, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, State, Confidence, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText |
     Export-Csv -Path $DetailCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ("Detail CSV written: " + $DetailCsv) -ForegroundColor Green
+
+# =============================================================================
+# 4b. TRANSCRIPT CONTEXT - what was said around each suggestion (the "why")
+#     Requires: speechAndTextAnalytics > data > view, and voice transcription
+#     or digital transcripts enabled on the relevant queues.
+# =============================================================================
+if ($IncludeTranscriptContext) {
+    Write-Host ""
+    Write-Host "Fetching transcripts for conversations that had knowledge suggestions..." -ForegroundColor Cyan
+
+    $transcriptRows = @()
+    $doneConvs = @{}
+    $epochBase = [datetime]"1970-01-01T00:00:00Z"
+
+    foreach ($row in $detailRows) {
+        if ($doneConvs.ContainsKey($row.ConversationId)) { continue }
+        $doneConvs[$row.ConversationId] = $true
+
+        # Find the customer session id captured earlier for this conversation
+        $commId = ""
+        foreach ($c in $conversationList) {
+            if ($c.ConversationId -eq $row.ConversationId) { $commId = $c.CustomerSessionId; break }
+        }
+        if ($commId -eq "") {
+            Write-Warning ("No customer session id for conversation " + $row.ConversationId + " - skipping transcript.")
+            continue
+        }
+
+        $turlUri = $ApiBase + "/api/v2/speechandtextanalytics/conversations/" + $row.ConversationId + "/communications/" + $commId + "/transcripturl"
+        $turl = Invoke-GcApi -Method "Get" -Uri $turlUri -Headers $headers
+        if (-not $turl -or -not $turl.url) { continue }
+
+        # The returned URL is pre-signed - fetch without auth headers
+        $tdoc = $null
+        try {
+            $tdoc = Invoke-RestMethod -Method Get -Uri ([string]$turl.url) -ErrorAction Stop
+        }
+        catch {
+            Write-Warning ("Transcript download failed for " + $row.ConversationId + " :: " + $_.Exception.Message)
+            continue
+        }
+        if (-not $tdoc) { continue }
+
+        # Transcript JSON: transcripts[] -> phrases[] with text / participantPurpose / startTimeMs
+        $tsets = @()
+        if ($tdoc.transcripts) { $tsets = @($tdoc.transcripts) }
+        elseif ($tdoc.phrases) { $tsets = @($tdoc) }
+
+        foreach ($tset in $tsets) {
+            $phrases = @()
+            if ($tset.phrases) { $phrases = @($tset.phrases) }
+            foreach ($ph in $phrases) {
+                $text = ""
+                if ($ph.text) { $text = [string]$ph.text }
+                elseif ($ph.decoratedText) { $text = [string]$ph.decoratedText }
+                if ($text -eq "") { continue }
+
+                $speaker = ""
+                if ($ph.participantPurpose) { $speaker = [string]$ph.participantPurpose }
+
+                # startTimeMs may be epoch milliseconds (absolute) or an offset
+                $phTimeUtc = ""
+                $rawMs = 0
+                $gotMs = $false
+                try {
+                    if ($ph.startTimeMs) { $rawMs = [double]$ph.startTimeMs; $gotMs = $true }
+                } catch { $gotMs = $false }
+                if ($gotMs) {
+                    if ($rawMs -gt 1000000000000) {
+                        # epoch ms -> UTC datetime via instance method (CLM-safe)
+                        $dt = $epochBase.AddMilliseconds($rawMs)
+                        $phTimeUtc = $dt.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
+                    }
+                    else {
+                        # offset ms from start of communication
+                        $phTimeUtc = "offset:" + [string][int]$rawMs + "ms"
+                    }
+                }
+
+                $transcriptRows += New-Object PSObject -Property @{
+                    ConversationId = $row.ConversationId
+                    PhraseTimeUtc  = $phTimeUtc
+                    Speaker        = $speaker
+                    Text           = $text
+                }
+            }
+        }
+    }
+
+    if ($transcriptRows.Count -gt 0) {
+        $transcriptRows |
+            Select-Object ConversationId, PhraseTimeUtc, Speaker, Text |
+            Export-Csv -Path $TranscriptCsv -NoTypeInformation -Encoding UTF8
+        Write-Host ("Transcript CSV written: " + $TranscriptCsv + " (" + $transcriptRows.Count + " phrases)") -ForegroundColor Green
+        Write-Host "Join it to the detail CSV on ConversationId, then compare PhraseTimeUtc against SuggestedAtUtc - the customer phrases just BEFORE the suggestion are what triggered the article." -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "No transcripts retrieved. Check 'speechAndTextAnalytics > data > view' permission and that voice transcription is enabled for these queues." -ForegroundColor Yellow
+    }
+}
 
 # =============================================================================
 # 5. BUILD PER-ARTICLE KB IMPROVEMENT SUMMARY
