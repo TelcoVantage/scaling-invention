@@ -1,30 +1,43 @@
 <#
 .SYNOPSIS
-    Extracts Agent Copilot knowledge article suggestions per conversation for a
-    specific division in Genesys Cloud (Australia region), to audit KB article
-    effectiveness.
+    Extracts, per conversation in a specific Genesys Cloud division (Australia
+    region), the agent, queue, conversation transcript and the knowledge base
+    articles that were presented (Agent Copilot suggestions) - to audit and
+    improve KB article effectiveness.
 
 .DESCRIPTION
     Flow:
       1. OAuth client credentials token (Basic auth header built with a pure
          PowerShell Base64 encoder - Constrained Language Mode safe).
       2. POST /api/v2/analytics/conversations/details/query filtered by
-         divisionId, paged.
+         divisionId, paged. Captures agent userId, queue id, customer/agent
+         session ids per conversation.
       3. GET /api/v2/conversations/{id}/suggestions for each conversation
-         (Agent Copilot knowledge suggestions).
-      4. Exports two CSVs:
-         - Detail: one row per suggestion per conversation.
-         - Summary: per KB article - presented count, accepted count,
-           acceptance rate, average confidence.
+         (Agent Copilot knowledge suggestions - which article, when, why).
+      4. GET /api/v2/speechandtextanalytics/.../transcripturl per conversation
+         to pull the transcript text (customer + agent phrases).
+      5. Resolves agent userIds -> names (GET /api/v2/users/{id}) and
+         queue ids -> names (GET /api/v2/routing/queues/{id}), cached.
+      6. Exports four CSVs:
+         - Overview : ONE ROW PER CONVERSATION - agent, queue, transcript
+                      text, articles presented and why. (The main deliverable.)
+         - Detail   : one row per article suggestion (drill-down).
+         - Transcript: one row per transcript phrase (timeline join).
+         - Summary  : per KB article - presented/accepted counts, acceptance
+                      rate, average confidence (rewrite candidates).
 
-    CLM-safe: no .NET static methods, no ::new(), no [pscustomobject] casts.
-    Windows PowerShell 5.1 / Constrained Language Mode compatible.
+    CLM-safe: no .NET static method calls, no ::new(), no [pscustomobject]
+    casts, no [uri]:: encoding. Windows PowerShell 5.1 / Constrained Language
+    Mode compatible.
 
 .NOTES
     Required OAuth client (Client Credentials grant) role permissions:
       - analytics > conversationDetail > view
-      - conversation > suggestion > view   (Agent Copilot suggestions)
-      - knowledge > document > view        (optional - title lookup fallback)
+      - conversation > suggestion > view      (Agent Copilot suggestions)
+      - speechAndTextAnalytics > data > view  (transcripts)
+      - routing > queue > view                (queue name lookup)
+      - directory > user > view               (agent name lookup)
+      - knowledge > document > view           (optional - title fallback)
     Division-aware permissions must include the target division.
 
     Copilot suggestion data has limited retention - run this regularly
@@ -53,7 +66,16 @@ $IncludeMediaFilter       = $true   # set $false to test with ONLY the division 
 $ShowRequestBody          = $false  # echoes the JSON body sent to the analytics query
 $OnlyCopilotConversations = $true   # only pull conversations where an agent assistant (Copilot) was present
 $DumpFirstSuggestion      = $true   # dumps the first raw non-empty suggestions response (schema check)
-$IncludeTranscriptContext = $true   # fetch S&TA transcripts for conversations that had KB suggestions
+
+# Transcript scope:
+#   $false = only fetch transcripts for conversations where a KB article was
+#            presented (fewer API calls - recommended)
+#   $true  = fetch transcripts for EVERY conversation in the division/window
+$TranscriptAllConversations = $false
+
+# Excel cell hard limit is 32,767 chars - transcripts longer than this are
+# truncated in the overview CSV (full phrases remain in the transcript CSV)
+$TranscriptMaxChars = 30000
 
 # Output
 $OutputFolder  = "C:\Temp\GenesysKB"
@@ -295,6 +317,36 @@ if ($DivisionId -notmatch $guidPattern) {
 }
 
 # =============================================================================
+# 1c. NAME RESOLUTION HELPERS (agent userId -> name, queueId -> name), cached
+# =============================================================================
+$userNameCache  = @{}
+$queueNameCache = @{}
+
+function Resolve-AgentName {
+    param([string]$UserId, [hashtable]$AuthHeaders)
+    if ($UserId -eq "") { return "" }
+    if ($script:userNameCache.ContainsKey($UserId)) { return $script:userNameCache[$UserId] }
+    $name = ""
+    $u = Invoke-GcApi -Method "Get" -Uri ($script:ApiBase + "/api/v2/users/" + $UserId + "?state=any") -Headers $AuthHeaders
+    if ($u -and $u.name) { $name = [string]$u.name }
+    if ($name -eq "") { $name = $UserId }   # fall back to the raw id
+    $script:userNameCache[$UserId] = $name
+    return $name
+}
+
+function Resolve-QueueName {
+    param([string]$QueueId, [hashtable]$AuthHeaders)
+    if ($QueueId -eq "") { return "" }
+    if ($script:queueNameCache.ContainsKey($QueueId)) { return $script:queueNameCache[$QueueId] }
+    $name = ""
+    $q = Invoke-GcApi -Method "Get" -Uri ($script:ApiBase + "/api/v2/routing/queues/" + $QueueId) -Headers $AuthHeaders
+    if ($q -and $q.name) { $name = [string]$q.name }
+    if ($name -eq "") { $name = $QueueId }  # fall back to the raw id
+    $script:queueNameCache[$QueueId] = $name
+    return $name
+}
+
+# =============================================================================
 # 2. GET CONVERSATIONS FOR THE DIVISION (analytics details query, paged)
 # =============================================================================
 $endUtc   = Get-Date
@@ -386,17 +438,29 @@ while ($true) {
     if ($page.conversations) {
         $count = @($page.conversations).Count
         foreach ($conv in $page.conversations) {
-            $queueId    = ""
-            $custSessId = ""
-            $convMedia  = ""
+            $queueId     = ""
+            $agentUserId = ""
+            $custSessId  = ""
+            $agentSessId = ""
+            $convMedia   = ""
             foreach ($p in $conv.participants) {
                 $purpose = ""
                 if ($p.purpose) { $purpose = [string]$p.purpose }
+
+                # First agent participant with a userId = the handling agent
+                if ($agentUserId -eq "" -and $purpose -eq "agent" -and $p.userId) {
+                    $agentUserId = [string]$p.userId
+                }
+
                 foreach ($s in $p.sessions) {
                     if ($convMedia -eq "" -and $s.mediaType) { $convMedia = [string]$s.mediaType }
-                    # Customer-side session id doubles as communicationId for transcript retrieval
+                    # Session ids double as communicationId for transcript retrieval:
+                    # customer side preferred, agent side kept as fallback
                     if ($custSessId -eq "" -and ($purpose -eq "customer" -or $purpose -eq "external") -and $s.sessionId) {
                         $custSessId = [string]$s.sessionId
+                    }
+                    if ($agentSessId -eq "" -and $purpose -eq "agent" -and $s.sessionId) {
+                        $agentSessId = [string]$s.sessionId
                     }
                     foreach ($seg in $s.segments) {
                         if ($seg.queueId -and $queueId -eq "") { $queueId = [string]$seg.queueId }
@@ -408,8 +472,10 @@ while ($true) {
                 ConversationStart = [string]$conv.conversationStart
                 ConversationEnd   = [string]$conv.conversationEnd
                 QueueId           = $queueId
+                AgentUserId       = $agentUserId
                 MediaType         = $convMedia
                 CustomerSessionId = $custSessId
+                AgentSessionId    = $agentSessId
             }
         }
     }
@@ -494,12 +560,26 @@ foreach ($conv in $conversationList) {
         # Confidence can sit at top level, inside the trigger, or inside the article payload
         $confidence = Find-ScalarProp $sug @("confidence")
 
-        # WHY was it presented - the detected intent that fired the Copilot rule.
-        # Search the trigger subtree first (most specific), then the whole object.
+        # WHY was it presented - the trigger that fired the Copilot rule.
+        # trigger.type tells us what trigger.value means:
+        #   type like "Intent"    -> value is the detected intent NAME
+        #   type like "Utterance" -> value is the spoken/typed TEXT itself
+        # (The old code shoved value into the intent column regardless - that
+        #  is why TriggeringText came out empty for utterance triggers.)
         $intentName = ""
+        $trigTime   = ""
         $trigObj = Find-ObjectProp $sug "trigger"
         if ($trigObj) {
-            $intentName = Find-ScalarProp $trigObj @("intent", "intentName", "name", "value")
+            $trigType  = Find-ScalarProp $trigObj @("type")
+            $trigValue = Find-ScalarProp $trigObj @("value")
+            $trigTime  = Find-ScalarProp $trigObj @("eventTime", "dateCreated", "timestamp")
+            if ($trigType -like "*ntent*") {
+                $intentName = $trigValue
+            }
+            elseif ($trigValue -ne "") {
+                $utterance = $trigValue
+            }
+            if ($intentName -eq "") { $intentName = Find-ScalarProp $trigObj @("intent", "intentName", "name") }
         }
         if ($intentName -eq "") { $intentName = Find-ScalarProp $sug @("intent", "intentName") }
 
@@ -531,10 +611,14 @@ foreach ($conv in $conversationList) {
         if ($title -eq "") { $title = Find-ScalarProp $sug @("title") }
 
         # The phrase / search query that caused the suggestion = the "why"
-        $utterance = Find-ScalarProp $sug @("query", "searchQuery", "utterance", "transcriptionText")
-        if ($utterance -eq "" -and $trigObj) {
-            $utterance = Find-ScalarProp $trigObj @("text", "message", "phrase")
+        if ($utterance -eq "") {
+            $utterance = Find-ScalarProp $sug @("query", "searchQuery", "utterance", "transcriptionText")
         }
+        if ($utterance -eq "" -and $trigObj) {
+            $utterance = Find-ScalarProp $trigObj @("text", "message", "phrase", "utterance")
+        }
+        $utteranceSource = ""
+        if ($utterance -ne "") { $utteranceSource = "copilot-api" }
 
         # Title fallback via Knowledge API (cached per document)
         if ($title -eq "" -and $kbId -ne "" -and $docId -ne "") {
@@ -554,10 +638,12 @@ foreach ($conv in $conversationList) {
             ConversationId    = $conv.ConversationId
             ConversationStart = $conv.ConversationStart
             QueueId           = $conv.QueueId
+            AgentUserId       = $conv.AgentUserId
             MediaType         = $conv.MediaType
             SuggestionId      = [string]$sug.id
             SuggestionType    = $sugType
             SuggestedAtUtc    = $sugTime
+            TriggerTimeUtc    = $trigTime
             State             = $state
             Confidence        = $confidence
             TriggerIntent     = $intentName
@@ -566,6 +652,7 @@ foreach ($conv in $conversationList) {
             DocumentVersion   = $docVersion
             ArticleTitle      = $title
             TriggeringText    = $utterance
+            TriggerTextSource = $utteranceSource
         }
     }
 }
@@ -589,23 +676,226 @@ if ($detailRows.Count -eq 0) {
 }
 
 # =============================================================================
-# 4. PRIMARY OUTPUT: ONE ROW PER CONVERSATION
-#    Conversation -> was an article presented (in any way) -> why
+# 4. TRANSCRIPTS - what was said in each conversation
+#    Fetched BEFORE the overview so the transcript text can sit on the same
+#    row as agent / queue / articles presented.
+#    Requires: speechAndTextAnalytics > data > view, and voice transcription
+#    or digital transcripts enabled on the relevant queues.
 # =============================================================================
+Write-Host ""
+Write-Host "Fetching transcripts..." -ForegroundColor Cyan
+
+# Which conversations get a transcript?
+$transcriptConvIds = @{}
+if ($TranscriptAllConversations) {
+    foreach ($c in $conversationList) { $transcriptConvIds[$c.ConversationId] = $true }
+}
+else {
+    foreach ($d in $detailRows) { $transcriptConvIds[$d.ConversationId] = $true }
+}
+Write-Host ("Transcript scope: " + $transcriptConvIds.Keys.Count + " conversation(s)")
+
+$transcriptRows = @()     # one row per phrase (for the transcript CSV)
+$convTranscripts = @{}    # conversationId -> single joined text block (for the overview CSV)
+$convPhrases = @{}        # conversationId -> phrase objects with parsed times (for trigger-text backfill)
+$epochBase = [datetime]"1970-01-01T00:00:00Z"
+
+foreach ($c in $conversationList) {
+    if (-not $transcriptConvIds.ContainsKey($c.ConversationId)) { continue }
+
+    # Try the customer-side communication first, then the agent side
+    $commIds = @()
+    if ($c.CustomerSessionId -ne "") { $commIds += $c.CustomerSessionId }
+    if ($c.AgentSessionId -ne "")    { $commIds += $c.AgentSessionId }
+    if ($commIds.Count -eq 0) {
+        Write-Warning ("No session id for conversation " + $c.ConversationId + " - skipping transcript.")
+        continue
+    }
+
+    $tdoc = $null
+    foreach ($commId in $commIds) {
+        $turlUri = $ApiBase + "/api/v2/speechandtextanalytics/conversations/" + $c.ConversationId + "/communications/" + $commId + "/transcripturl"
+        $turl = Invoke-GcApi -Method "Get" -Uri $turlUri -Headers $headers
+        if (-not $turl -or -not $turl.url) { continue }
+
+        # The returned URL is pre-signed - fetch without auth headers
+        try {
+            $tdoc = Invoke-RestMethod -Method Get -Uri ([string]$turl.url) -ErrorAction Stop
+        }
+        catch {
+            Write-Warning ("Transcript download failed for " + $c.ConversationId + " :: " + $_.Exception.Message)
+            $tdoc = $null
+        }
+        if ($tdoc) { break }
+    }
+    if (-not $tdoc) { continue }
+
+    # Transcript JSON: transcripts[] -> phrases[] with text / participantPurpose / startTimeMs
+    $tsets = @()
+    if ($tdoc.transcripts) { $tsets = @($tdoc.transcripts) }
+    elseif ($tdoc.phrases) { $tsets = @($tdoc) }
+
+    $joined = ""
+    $phraseObjs = @()
+    foreach ($tset in $tsets) {
+        $phrases = @()
+        if ($tset.phrases) { $phrases = @($tset.phrases) }
+        foreach ($ph in $phrases) {
+            $text = ""
+            if ($ph.text) { $text = [string]$ph.text }
+            elseif ($ph.decoratedText) { $text = [string]$ph.decoratedText }
+            if ($text -eq "") { continue }
+
+            $speaker = ""
+            if ($ph.participantPurpose) { $speaker = [string]$ph.participantPurpose }
+            if ($speaker -eq "") { $speaker = "unknown" }
+
+            # startTimeMs may be epoch milliseconds (absolute) or an offset
+            $phTimeUtc = ""
+            $parsedTime = $null
+            $rawMs = 0
+            $gotMs = $false
+            try {
+                if ($ph.startTimeMs) { $rawMs = [double]$ph.startTimeMs; $gotMs = $true }
+            } catch { $gotMs = $false }
+            if ($gotMs) {
+                if ($rawMs -gt 1000000000000) {
+                    # epoch ms -> UTC datetime via instance methods (CLM-safe).
+                    # The [datetime]"...Z" cast converts to LOCAL time, so
+                    # normalise back to true UTC to match the API's UTC strings.
+                    $dt = $epochBase.AddMilliseconds($rawMs)
+                    $dt = $dt.ToUniversalTime()
+                    $phTimeUtc = $dt.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
+                    $parsedTime = $dt
+                }
+                else {
+                    # offset ms from start of communication
+                    $phTimeUtc = "offset:" + [string][int]$rawMs + "ms"
+                }
+            }
+
+            $transcriptRows += New-Object PSObject -Property @{
+                ConversationId = $c.ConversationId
+                PhraseTimeUtc  = $phTimeUtc
+                Speaker        = $speaker
+                Text           = $text
+            }
+
+            $phraseObjs += New-Object PSObject -Property @{
+                ParsedTime = $parsedTime
+                Speaker    = $speaker
+                Text       = $text
+            }
+
+            if ($joined -ne "") { $joined = $joined + "`n" }
+            $joined = $joined + "[" + $speaker + "] " + $text
+        }
+    }
+
+    if ($phraseObjs.Count -gt 0) {
+        $convPhrases[$c.ConversationId] = $phraseObjs
+    }
+
+    if ($joined -ne "") {
+        if ($joined.Length -gt $TranscriptMaxChars) {
+            $joined = $joined.Substring(0, $TranscriptMaxChars) + " ...[TRUNCATED - full text in transcript CSV]"
+        }
+        $convTranscripts[$c.ConversationId] = $joined
+    }
+}
+
+Write-Host ("Transcripts retrieved for " + $convTranscripts.Keys.Count + " conversation(s), " + $transcriptRows.Count + " phrases total.") -ForegroundColor Green
+if ($transcriptConvIds.Keys.Count -gt 0 -and $convTranscripts.Keys.Count -eq 0) {
+    Write-Host "No transcripts retrieved. Check 'speechAndTextAnalytics > data > view' permission and that voice transcription / digital transcripts are enabled for these queues." -ForegroundColor Yellow
+}
+
+# =============================================================================
+# 4b. BACKFILL TriggeringText FROM THE TRANSCRIPT
+#     The Copilot suggestions API frequently returns only an intent reference
+#     in the trigger - not the spoken/typed text. When TriggeringText is
+#     empty, derive it: the customer phrases spoken just BEFORE the suggestion
+#     fired are what triggered the article.
+# =============================================================================
+$backfilled = 0
+foreach ($d in $detailRows) {
+    if ($d.TriggeringText -ne "") { continue }
+    if (-not $convPhrases.ContainsKey($d.ConversationId)) { continue }
+
+    # Customer-side phrases only - those are what Copilot listens to
+    $custPhrases = @()
+    foreach ($ph in $convPhrases[$d.ConversationId]) {
+        if ($ph.Speaker -eq "customer" -or $ph.Speaker -eq "external") { $custPhrases += $ph }
+    }
+    if ($custPhrases.Count -eq 0) { continue }
+
+    # Reference time: trigger eventTime if present, else when the suggestion was
+    # created. Normalised to UTC so it compares correctly with phrase times.
+    $refTime = $null
+    $refStr = [string]$d.TriggerTimeUtc
+    if ($refStr -eq "") { $refStr = [string]$d.SuggestedAtUtc }
+    if ($refStr -match "^[0-9]{12,}$") {
+        # epoch milliseconds delivered as a bare number
+        try {
+            $refTime = $epochBase.AddMilliseconds([double]$refStr)
+            $refTime = $refTime.ToUniversalTime()
+        } catch { $refTime = $null }
+    }
+    elseif ($refStr -ne "") {
+        try {
+            $refTime = [datetime]$refStr
+            $refTime = $refTime.ToUniversalTime()
+        } catch { $refTime = $null }
+    }
+
+    $picked = @()
+    if ($null -ne $refTime) {
+        # Last 2 timestamped customer phrases at/before the suggestion moment
+        foreach ($ph in $custPhrases) {
+            if ($null -ne $ph.ParsedTime -and $ph.ParsedTime -le $refTime) { $picked += $ph.Text }
+        }
+        if ($picked.Count -gt 2) {
+            $picked = @($picked[($picked.Count - 2)], $picked[($picked.Count - 1)])
+        }
+    }
+    if ($picked.Count -eq 0) {
+        # No usable timestamps (e.g. offset-only digital transcripts) - fall back
+        # to the customer's opening phrases, the usual reason for contact
+        $take = 2
+        if ($custPhrases.Count -lt $take) { $take = $custPhrases.Count }
+        for ($k = 0; $k -lt $take; $k++) { $picked += $custPhrases[$k].Text }
+    }
+
+    if ($picked.Count -gt 0) {
+        $d.TriggeringText    = ($picked -join " ")
+        $d.TriggerTextSource = "transcript-derived"
+        $backfilled++
+    }
+}
+if ($backfilled -gt 0) {
+    Write-Host ("TriggeringText backfilled from transcripts for " + $backfilled + " suggestion row(s).") -ForegroundColor Green
+}
+
+# =============================================================================
+# 5. PRIMARY OUTPUT: ONE ROW PER CONVERSATION
+#    Conversation -> agent -> queue -> transcript -> article(s) presented -> why
+# =============================================================================
+Write-Host ""
+Write-Host "Resolving agent and queue names..." -ForegroundColor Cyan
+
 $overviewRows = @()
 foreach ($c in $conversationList) {
-    $matches = @()
+    $convSuggestions = @()
     foreach ($d in $detailRows) {
-        if ($d.ConversationId -eq $c.ConversationId) { $matches += $d }
+        if ($d.ConversationId -eq $c.ConversationId) { $convSuggestions += $d }
     }
 
     $presented  = "NO"
     $articles   = ""
     $whyParts   = @()
-    if ($matches.Count -gt 0) {
+    if ($convSuggestions.Count -gt 0) {
         $presented = "YES"
         $titles = @()
-        foreach ($m in $matches) {
+        foreach ($m in $convSuggestions) {
             $t = $m.ArticleTitle
             if ($t -eq "") { $t = $m.DocumentId }
             if ($t -eq "") { $t = "(unidentified " + $m.SuggestionType + " suggestion " + $m.SuggestionId + ")" }
@@ -624,140 +914,87 @@ foreach ($c in $conversationList) {
         $articles = $titles -join "; "
     }
 
+    $agentName = Resolve-AgentName -UserId $c.AgentUserId -AuthHeaders $headers
+    $queueName = Resolve-QueueName -QueueId $c.QueueId    -AuthHeaders $headers
+
+    $transcriptText = ""
+    if ($convTranscripts.ContainsKey($c.ConversationId)) {
+        $transcriptText = $convTranscripts[$c.ConversationId]
+    }
+
     $overviewRows += New-Object PSObject -Property @{
         ConversationId    = $c.ConversationId
         ConversationStart = $c.ConversationStart
-        QueueId           = $c.QueueId
+        Agent             = $agentName
+        Queue             = $queueName
         MediaType         = $c.MediaType
         ArticlePresented  = $presented
-        ArticleCount      = $matches.Count
+        ArticleCount      = $convSuggestions.Count
         Articles          = $articles
         WhyPresented      = ($whyParts -join " || ")
+        Transcript        = $transcriptText
     }
 }
 
 $overviewRows |
     Sort-Object ConversationStart |
-    Select-Object ConversationId, ConversationStart, QueueId, MediaType, ArticlePresented, ArticleCount, Articles, WhyPresented |
+    Select-Object ConversationId, ConversationStart, Agent, Queue, MediaType, ArticlePresented, ArticleCount, Articles, WhyPresented, Transcript |
     Export-Csv -Path $OverviewCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ("PER-CONVERSATION overview written: " + $OverviewCsv) -ForegroundColor Green
 
 # =============================================================================
-# 4a. EXPORT DETAIL CSV (one row per suggestion - the drill-down)
+# 5a. EXPORT DETAIL CSV (one row per suggestion - the drill-down)
 # =============================================================================
 if ($detailRows.Count -eq 0) {
     Write-Host "No suggestion rows - skipping detail, transcript and summary CSVs." -ForegroundColor Yellow
     exit 0
 }
-$detailRows |
-    Select-Object ConversationId, ConversationStart, QueueId, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, State, Confidence, TriggerIntent, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText |
+
+# Stamp resolved names onto the detail rows too (cached - no extra API calls)
+$detailOut = @()
+foreach ($d in $detailRows) {
+    $detailOut += New-Object PSObject -Property @{
+        ConversationId    = $d.ConversationId
+        ConversationStart = $d.ConversationStart
+        Agent             = (Resolve-AgentName -UserId $d.AgentUserId -AuthHeaders $headers)
+        Queue             = (Resolve-QueueName -QueueId $d.QueueId    -AuthHeaders $headers)
+        MediaType         = $d.MediaType
+        SuggestionId      = $d.SuggestionId
+        SuggestionType    = $d.SuggestionType
+        SuggestedAtUtc    = $d.SuggestedAtUtc
+        TriggerTimeUtc    = $d.TriggerTimeUtc
+        State             = $d.State
+        Confidence        = $d.Confidence
+        TriggerIntent     = $d.TriggerIntent
+        KnowledgeBaseId   = $d.KnowledgeBaseId
+        DocumentId        = $d.DocumentId
+        DocumentVersion   = $d.DocumentVersion
+        ArticleTitle      = $d.ArticleTitle
+        TriggeringText    = $d.TriggeringText
+        TriggerTextSource = $d.TriggerTextSource
+    }
+}
+
+$detailOut |
+    Select-Object ConversationId, ConversationStart, Agent, Queue, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, TriggerTimeUtc, State, Confidence, TriggerIntent, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText, TriggerTextSource |
     Export-Csv -Path $DetailCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ("Detail CSV written: " + $DetailCsv) -ForegroundColor Green
 
 # =============================================================================
-# 4b. TRANSCRIPT CONTEXT - what was said around each suggestion (the "why")
-#     Requires: speechAndTextAnalytics > data > view, and voice transcription
-#     or digital transcripts enabled on the relevant queues.
+# 5b. EXPORT TRANSCRIPT CSV (one row per phrase - the timeline)
 # =============================================================================
-if ($IncludeTranscriptContext) {
-    Write-Host ""
-    Write-Host "Fetching transcripts for conversations that had knowledge suggestions..." -ForegroundColor Cyan
-
-    $transcriptRows = @()
-    $doneConvs = @{}
-    $epochBase = [datetime]"1970-01-01T00:00:00Z"
-
-    foreach ($row in $detailRows) {
-        if ($doneConvs.ContainsKey($row.ConversationId)) { continue }
-        $doneConvs[$row.ConversationId] = $true
-
-        # Find the customer session id captured earlier for this conversation
-        $commId = ""
-        foreach ($c in $conversationList) {
-            if ($c.ConversationId -eq $row.ConversationId) { $commId = $c.CustomerSessionId; break }
-        }
-        if ($commId -eq "") {
-            Write-Warning ("No customer session id for conversation " + $row.ConversationId + " - skipping transcript.")
-            continue
-        }
-
-        $turlUri = $ApiBase + "/api/v2/speechandtextanalytics/conversations/" + $row.ConversationId + "/communications/" + $commId + "/transcripturl"
-        $turl = Invoke-GcApi -Method "Get" -Uri $turlUri -Headers $headers
-        if (-not $turl -or -not $turl.url) { continue }
-
-        # The returned URL is pre-signed - fetch without auth headers
-        $tdoc = $null
-        try {
-            $tdoc = Invoke-RestMethod -Method Get -Uri ([string]$turl.url) -ErrorAction Stop
-        }
-        catch {
-            Write-Warning ("Transcript download failed for " + $row.ConversationId + " :: " + $_.Exception.Message)
-            continue
-        }
-        if (-not $tdoc) { continue }
-
-        # Transcript JSON: transcripts[] -> phrases[] with text / participantPurpose / startTimeMs
-        $tsets = @()
-        if ($tdoc.transcripts) { $tsets = @($tdoc.transcripts) }
-        elseif ($tdoc.phrases) { $tsets = @($tdoc) }
-
-        foreach ($tset in $tsets) {
-            $phrases = @()
-            if ($tset.phrases) { $phrases = @($tset.phrases) }
-            foreach ($ph in $phrases) {
-                $text = ""
-                if ($ph.text) { $text = [string]$ph.text }
-                elseif ($ph.decoratedText) { $text = [string]$ph.decoratedText }
-                if ($text -eq "") { continue }
-
-                $speaker = ""
-                if ($ph.participantPurpose) { $speaker = [string]$ph.participantPurpose }
-
-                # startTimeMs may be epoch milliseconds (absolute) or an offset
-                $phTimeUtc = ""
-                $rawMs = 0
-                $gotMs = $false
-                try {
-                    if ($ph.startTimeMs) { $rawMs = [double]$ph.startTimeMs; $gotMs = $true }
-                } catch { $gotMs = $false }
-                if ($gotMs) {
-                    if ($rawMs -gt 1000000000000) {
-                        # epoch ms -> UTC datetime via instance method (CLM-safe)
-                        $dt = $epochBase.AddMilliseconds($rawMs)
-                        $phTimeUtc = $dt.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
-                    }
-                    else {
-                        # offset ms from start of communication
-                        $phTimeUtc = "offset:" + [string][int]$rawMs + "ms"
-                    }
-                }
-
-                $transcriptRows += New-Object PSObject -Property @{
-                    ConversationId = $row.ConversationId
-                    PhraseTimeUtc  = $phTimeUtc
-                    Speaker        = $speaker
-                    Text           = $text
-                }
-            }
-        }
-    }
-
-    if ($transcriptRows.Count -gt 0) {
-        $transcriptRows |
-            Select-Object ConversationId, PhraseTimeUtc, Speaker, Text |
-            Export-Csv -Path $TranscriptCsv -NoTypeInformation -Encoding UTF8
-        Write-Host ("Transcript CSV written: " + $TranscriptCsv + " (" + $transcriptRows.Count + " phrases)") -ForegroundColor Green
-        Write-Host "Join it to the detail CSV on ConversationId, then compare PhraseTimeUtc against SuggestedAtUtc - the customer phrases just BEFORE the suggestion are what triggered the article." -ForegroundColor Cyan
-    }
-    else {
-        Write-Host "No transcripts retrieved. Check 'speechAndTextAnalytics > data > view' permission and that voice transcription is enabled for these queues." -ForegroundColor Yellow
-    }
+if ($transcriptRows.Count -gt 0) {
+    $transcriptRows |
+        Select-Object ConversationId, PhraseTimeUtc, Speaker, Text |
+        Export-Csv -Path $TranscriptCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ("Transcript CSV written: " + $TranscriptCsv + " (" + $transcriptRows.Count + " phrases)") -ForegroundColor Green
+    Write-Host "Join it to the detail CSV on ConversationId, then compare PhraseTimeUtc against SuggestedAtUtc - the customer phrases just BEFORE the suggestion are what triggered the article." -ForegroundColor Cyan
 }
 
 # =============================================================================
-# 5. BUILD PER-ARTICLE KB IMPROVEMENT SUMMARY
+# 6. BUILD PER-ARTICLE KB IMPROVEMENT SUMMARY
 # =============================================================================
 $summaryRows = @()
 $grouped = $detailRows | Group-Object DocumentId
