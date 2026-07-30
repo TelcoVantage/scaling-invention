@@ -58,6 +58,7 @@ $IncludeTranscriptContext = $true   # fetch S&TA transcripts for conversations t
 # Output
 $OutputFolder  = "C:\Temp\GenesysKB"
 $RunStamp      = Get-Date -Format "yyyyMMdd_HHmmss"
+$OverviewCsv   = $OutputFolder + "\KB_PerConversation_"              + $RunStamp + ".csv"
 $DetailCsv     = $OutputFolder + "\KnowledgeSuggestions_Detail_"     + $RunStamp + ".csv"
 $SummaryCsv    = $OutputFolder + "\KnowledgeSuggestions_Summary_"    + $RunStamp + ".csv"
 $TranscriptCsv = $OutputFolder + "\KnowledgeSuggestions_Transcript_" + $RunStamp + ".csv"
@@ -418,6 +419,24 @@ foreach ($conv in $conversationList) {
         if ($sug.state)      { $state      = [string]$sug.state }
         if ($sug.confidence) { $confidence = [string]$sug.confidence }
 
+        # WHY was it presented - the detected intent that fired the Copilot rule
+        $intentName = ""
+        if ($sug.trigger) {
+            if ($sug.trigger.intent -and $sug.trigger.intent.name) { $intentName = [string]$sug.trigger.intent.name }
+            elseif ($sug.trigger.intents) {
+                $firstIntent = @($sug.trigger.intents)[0]
+                if ($firstIntent -and $firstIntent.name) { $intentName = [string]$firstIntent.name }
+                elseif ($firstIntent) { $intentName = [string]$firstIntent }
+            }
+            elseif ($sug.trigger.name) { $intentName = [string]$sug.trigger.name }
+            elseif ($sug.trigger.type) { $intentName = [string]$sug.trigger.type }
+        }
+        if ($intentName -eq "" -and $sug.intent) {
+            if ($sug.intent.name) { $intentName = [string]$sug.intent.name }
+            else { $intentName = [string]$sug.intent }
+        }
+        if ($intentName -eq "" -and $sug.intentName) { $intentName = [string]$sug.intentName }
+
         # When was the article surfaced - needed to line up with the transcript
         if ($sug.dateCreated)      { $sugTime = [string]$sug.dateCreated }
         elseif ($sug.timestamp)    { $sugTime = [string]$sug.timestamp }
@@ -461,223 +480,4 @@ foreach ($conv in $conversationList) {
             }
             else {
                 $docUri = $ApiBase + "/api/v2/knowledge/knowledgebases/" + $kbId + "/documents/" + $docId
-                $doc = Invoke-GcApi -Method "Get" -Uri $docUri -Headers $headers
-                if ($doc -and $doc.title) { $title = [string]$doc.title }
-                $titleCache[$cacheKey] = $title
-            }
-        }
-
-        $detailRows += New-Object PSObject -Property @{
-            ConversationId    = $conv.ConversationId
-            ConversationStart = $conv.ConversationStart
-            QueueId           = $conv.QueueId
-            MediaType         = $conv.MediaType
-            SuggestionId      = [string]$sug.id
-            SuggestionType    = $sugType
-            SuggestedAtUtc    = $sugTime
-            State             = $state
-            Confidence        = $confidence
-            KnowledgeBaseId   = $kbId
-            DocumentId        = $docId
-            DocumentVersion   = $docVersion
-            ArticleTitle      = $title
-            TriggeringText    = $utterance
-        }
-    }
-}
-
-Write-Host ""
-Write-Host ("Suggestion endpoint results across " + $conversationList.Count + " conversations:") -ForegroundColor Cyan
-Write-Host ("  With suggestion data : " + $statHasData)
-Write-Host ("  200 but empty        : " + $statEmpty)
-Write-Host ("  404 / no data / error: " + $statNoData)
-Write-Host ("  Non-knowledge entries skipped: " + $statNonKb)
-Write-Host ("Knowledge suggestion rows collected: " + $detailRows.Count) -ForegroundColor Green
-
-if ($detailRows.Count -eq 0) {
-    Write-Host ""
-    Write-Host "Diagnosis guide:" -ForegroundColor Yellow
-    Write-Host " - Mostly 404/no data + warnings showing 403: OAuth client is missing 'conversation > suggestion > view' - add it to the role." -ForegroundColor Yellow
-    Write-Host " - Mostly 200-but-empty: suggestion data has likely aged out (short retention, similar to Copilot summaries ~10 days) - re-run with DaysBack = 2 or 3." -ForegroundColor Yellow
-    Write-Host " - Zero conversations found at all: your Copilot may be recorded under a different dimension - set OnlyCopilotConversations = `$false and retry." -ForegroundColor Yellow
-    Write-Host " - Non-knowledge entries skipped > 0 but rows = 0: only canned response/script suggestions fired - check Copilot rules and KB confidence threshold." -ForegroundColor Yellow
-    exit 0
-}
-
-# =============================================================================
-# 4. EXPORT DETAIL CSV (explicit column order for CLM property hashtables)
-# =============================================================================
-$detailRows |
-    Select-Object ConversationId, ConversationStart, QueueId, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, State, Confidence, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText |
-    Export-Csv -Path $DetailCsv -NoTypeInformation -Encoding UTF8
-
-Write-Host ("Detail CSV written: " + $DetailCsv) -ForegroundColor Green
-
-# =============================================================================
-# 4b. TRANSCRIPT CONTEXT - what was said around each suggestion (the "why")
-#     Requires: speechAndTextAnalytics > data > view, and voice transcription
-#     or digital transcripts enabled on the relevant queues.
-# =============================================================================
-if ($IncludeTranscriptContext) {
-    Write-Host ""
-    Write-Host "Fetching transcripts for conversations that had knowledge suggestions..." -ForegroundColor Cyan
-
-    $transcriptRows = @()
-    $doneConvs = @{}
-    $epochBase = [datetime]"1970-01-01T00:00:00Z"
-
-    foreach ($row in $detailRows) {
-        if ($doneConvs.ContainsKey($row.ConversationId)) { continue }
-        $doneConvs[$row.ConversationId] = $true
-
-        # Find the customer session id captured earlier for this conversation
-        $commId = ""
-        foreach ($c in $conversationList) {
-            if ($c.ConversationId -eq $row.ConversationId) { $commId = $c.CustomerSessionId; break }
-        }
-        if ($commId -eq "") {
-            Write-Warning ("No customer session id for conversation " + $row.ConversationId + " - skipping transcript.")
-            continue
-        }
-
-        $turlUri = $ApiBase + "/api/v2/speechandtextanalytics/conversations/" + $row.ConversationId + "/communications/" + $commId + "/transcripturl"
-        $turl = Invoke-GcApi -Method "Get" -Uri $turlUri -Headers $headers
-        if (-not $turl -or -not $turl.url) { continue }
-
-        # The returned URL is pre-signed - fetch without auth headers
-        $tdoc = $null
-        try {
-            $tdoc = Invoke-RestMethod -Method Get -Uri ([string]$turl.url) -ErrorAction Stop
-        }
-        catch {
-            Write-Warning ("Transcript download failed for " + $row.ConversationId + " :: " + $_.Exception.Message)
-            continue
-        }
-        if (-not $tdoc) { continue }
-
-        # Transcript JSON: transcripts[] -> phrases[] with text / participantPurpose / startTimeMs
-        $tsets = @()
-        if ($tdoc.transcripts) { $tsets = @($tdoc.transcripts) }
-        elseif ($tdoc.phrases) { $tsets = @($tdoc) }
-
-        foreach ($tset in $tsets) {
-            $phrases = @()
-            if ($tset.phrases) { $phrases = @($tset.phrases) }
-            foreach ($ph in $phrases) {
-                $text = ""
-                if ($ph.text) { $text = [string]$ph.text }
-                elseif ($ph.decoratedText) { $text = [string]$ph.decoratedText }
-                if ($text -eq "") { continue }
-
-                $speaker = ""
-                if ($ph.participantPurpose) { $speaker = [string]$ph.participantPurpose }
-
-                # startTimeMs may be epoch milliseconds (absolute) or an offset
-                $phTimeUtc = ""
-                $rawMs = 0
-                $gotMs = $false
-                try {
-                    if ($ph.startTimeMs) { $rawMs = [double]$ph.startTimeMs; $gotMs = $true }
-                } catch { $gotMs = $false }
-                if ($gotMs) {
-                    if ($rawMs -gt 1000000000000) {
-                        # epoch ms -> UTC datetime via instance method (CLM-safe)
-                        $dt = $epochBase.AddMilliseconds($rawMs)
-                        $phTimeUtc = $dt.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
-                    }
-                    else {
-                        # offset ms from start of communication
-                        $phTimeUtc = "offset:" + [string][int]$rawMs + "ms"
-                    }
-                }
-
-                $transcriptRows += New-Object PSObject -Property @{
-                    ConversationId = $row.ConversationId
-                    PhraseTimeUtc  = $phTimeUtc
-                    Speaker        = $speaker
-                    Text           = $text
-                }
-            }
-        }
-    }
-
-    if ($transcriptRows.Count -gt 0) {
-        $transcriptRows |
-            Select-Object ConversationId, PhraseTimeUtc, Speaker, Text |
-            Export-Csv -Path $TranscriptCsv -NoTypeInformation -Encoding UTF8
-        Write-Host ("Transcript CSV written: " + $TranscriptCsv + " (" + $transcriptRows.Count + " phrases)") -ForegroundColor Green
-        Write-Host "Join it to the detail CSV on ConversationId, then compare PhraseTimeUtc against SuggestedAtUtc - the customer phrases just BEFORE the suggestion are what triggered the article." -ForegroundColor Cyan
-    }
-    else {
-        Write-Host "No transcripts retrieved. Check 'speechAndTextAnalytics > data > view' permission and that voice transcription is enabled for these queues." -ForegroundColor Yellow
-    }
-}
-
-# =============================================================================
-# 5. BUILD PER-ARTICLE KB IMPROVEMENT SUMMARY
-# =============================================================================
-$summaryRows = @()
-$grouped = $detailRows | Group-Object DocumentId
-
-foreach ($g in $grouped) {
-    if ($g.Name -eq "") { continue }
-
-    $presented  = $g.Count
-    $accepted   = 0
-    $rejected   = 0
-    $confSum    = 0.0
-    $confCount  = 0
-    $firstTitle = ""
-    $firstKb    = ""
-    $convIds    = @{}
-
-    foreach ($row in $g.Group) {
-        if ($firstTitle -eq "" -and $row.ArticleTitle -ne "") { $firstTitle = $row.ArticleTitle }
-        if ($firstKb -eq "" -and $row.KnowledgeBaseId -ne "") { $firstKb = $row.KnowledgeBaseId }
-        $convIds[$row.ConversationId] = $true
-
-        if ($row.State -like "*Accept*") { $accepted++ }
-        if ($row.State -like "*Reject*" -or $row.State -like "*Dismiss*") { $rejected++ }
-
-        if ($row.Confidence -ne "") {
-            $c = 0.0
-            $parsed = $false
-            try { $c = [double]$row.Confidence; $parsed = $true } catch { $parsed = $false }
-            if ($parsed) {
-                $confSum = $confSum + $c
-                $confCount++
-            }
-        }
-    }
-
-    $avgConf = ""
-    if ($confCount -gt 0) {
-        $avgConf = "{0:N3}" -f ($confSum / $confCount)
-    }
-
-    $acceptRate = "0.0%"
-    if ($presented -gt 0) {
-        $acceptRate = "{0:N1}%" -f (($accepted / $presented) * 100)
-    }
-
-    $summaryRows += New-Object PSObject -Property @{
-        DocumentId          = $g.Name
-        ArticleTitle        = $firstTitle
-        KnowledgeBaseId     = $firstKb
-        TimesPresented      = $presented
-        UniqueConversations = $convIds.Keys.Count
-        TimesAccepted       = $accepted
-        TimesRejected       = $rejected
-        AcceptanceRate      = $acceptRate
-        AvgConfidence       = $avgConf
-    }
-}
-
-$summaryRows |
-    Sort-Object TimesPresented -Descending |
-    Select-Object ArticleTitle, DocumentId, KnowledgeBaseId, TimesPresented, UniqueConversations, TimesAccepted, TimesRejected, AcceptanceRate, AvgConfidence |
-    Export-Csv -Path $SummaryCsv -NoTypeInformation -Encoding UTF8
-
-Write-Host ("Summary CSV written: " + $SummaryCsv) -ForegroundColor Green
-Write-Host ""
-Write-Host "Done. Articles with high TimesPresented but low AcceptanceRate are your rewrite candidates." -ForegroundColor Cyan
+                $doc = Invoke-GcApi -Method "Get" -Uri 
