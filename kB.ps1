@@ -168,6 +168,78 @@ function Invoke-GcApi {
 }
 
 # =============================================================================
+# CLM-SAFE RECURSIVE PROPERTY FINDERS
+# Walk a deserialised JSON object tree and return the first match by name,
+# regardless of nesting depth - so schema differences don't break extraction.
+# =============================================================================
+function Test-IsScalar {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [string] -or $Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [bool]) { return $true }
+    return $false
+}
+
+function Find-ScalarProp {
+    param($Obj, [string[]]$Names, [int]$MaxDepth = 7)
+    if ($null -eq $Obj -or $MaxDepth -lt 0) { return "" }
+    if (Test-IsScalar $Obj) { return "" }
+    if ($Obj -is [array]) {
+        foreach ($item in $Obj) {
+            $v = Find-ScalarProp $item $Names ($MaxDepth - 1)
+            if ($v -ne "") { return $v }
+        }
+        return ""
+    }
+    $props = $null
+    try { $props = $Obj.PSObject.Properties } catch { return "" }
+    if (-not $props) { return "" }
+    # Pass 1: direct name match with a scalar value
+    foreach ($p in $props) {
+        foreach ($n in $Names) {
+            if ($p.Name -eq $n) {
+                if (Test-IsScalar $p.Value) {
+                    if (([string]$p.Value) -ne "") { return [string]$p.Value }
+                }
+            }
+        }
+    }
+    # Pass 2: recurse into children
+    foreach ($p in $props) {
+        if (-not (Test-IsScalar $p.Value)) {
+            $v = Find-ScalarProp $p.Value $Names ($MaxDepth - 1)
+            if ($v -ne "") { return $v }
+        }
+    }
+    return ""
+}
+
+function Find-ObjectProp {
+    param($Obj, [string]$Name, [int]$MaxDepth = 7)
+    if ($null -eq $Obj -or $MaxDepth -lt 0) { return $null }
+    if (Test-IsScalar $Obj) { return $null }
+    if ($Obj -is [array]) {
+        foreach ($item in $Obj) {
+            $v = Find-ObjectProp $item $Name ($MaxDepth - 1)
+            if ($null -ne $v) { return $v }
+        }
+        return $null
+    }
+    $props = $null
+    try { $props = $Obj.PSObject.Properties } catch { return $null }
+    if (-not $props) { return $null }
+    foreach ($p in $props) {
+        if ($p.Name -eq $Name -and $null -ne $p.Value -and -not (Test-IsScalar $p.Value)) { return $p.Value }
+    }
+    foreach ($p in $props) {
+        if (-not (Test-IsScalar $p.Value)) {
+            $v = Find-ObjectProp $p.Value $Name ($MaxDepth - 1)
+            if ($null -ne $v) { return $v }
+        }
+    }
+    return $null
+}
+
+# =============================================================================
 # 1. AUTHENTICATE
 # =============================================================================
 if (-not (Test-Path $OutputFolder)) {
@@ -389,9 +461,9 @@ foreach ($conv in $conversationList) {
 
     # One-off raw dump so we can verify the actual schema in your org
     if ($DumpFirstSuggestion -and (-not $dumpedSample)) {
-        Write-Host "---- RAW suggestions response (first non-empty) ----" -ForegroundColor Magenta
-        Write-Host ($sugResponse | ConvertTo-Json -Depth 12)
-        Write-Host "----------------------------------------------------" -ForegroundColor Magenta
+        $rawPath = $OutputFolder + "\RawSuggestionSample_" + $RunStamp + ".json"
+        ($sugResponse | ConvertTo-Json -Depth 15) | Out-File -FilePath $rawPath -Encoding UTF8
+        Write-Host ("Raw suggestions sample saved to: " + $rawPath) -ForegroundColor Magenta
         $dumpedSample = $true
     }
 
@@ -416,61 +488,53 @@ foreach ($conv in $conversationList) {
         $utterance   = ""
         $sugTime     = ""
 
-        if ($sug.state)      { $state      = [string]$sug.state }
-        if ($sug.confidence) { $confidence = [string]$sug.confidence }
+        if ($sug.state) { $state = [string]$sug.state }
+        else { $state = Find-ScalarProp $sug @("state") }
 
-        # WHY was it presented - the detected intent that fired the Copilot rule
+        # Confidence can sit at top level, inside the trigger, or inside the article payload
+        $confidence = Find-ScalarProp $sug @("confidence")
+
+        # WHY was it presented - the detected intent that fired the Copilot rule.
+        # Search the trigger subtree first (most specific), then the whole object.
         $intentName = ""
-        if ($sug.trigger) {
-            if ($sug.trigger.intent -and $sug.trigger.intent.name) { $intentName = [string]$sug.trigger.intent.name }
-            elseif ($sug.trigger.intents) {
-                $firstIntent = @($sug.trigger.intents)[0]
-                if ($firstIntent -and $firstIntent.name) { $intentName = [string]$firstIntent.name }
-                elseif ($firstIntent) { $intentName = [string]$firstIntent }
-            }
-            elseif ($sug.trigger.name) { $intentName = [string]$sug.trigger.name }
-            elseif ($sug.trigger.type) { $intentName = [string]$sug.trigger.type }
+        $trigObj = Find-ObjectProp $sug "trigger"
+        if ($trigObj) {
+            $intentName = Find-ScalarProp $trigObj @("intent", "intentName", "name", "value")
         }
-        if ($intentName -eq "" -and $sug.intent) {
-            if ($sug.intent.name) { $intentName = [string]$sug.intent.name }
-            else { $intentName = [string]$sug.intent }
-        }
-        if ($intentName -eq "" -and $sug.intentName) { $intentName = [string]$sug.intentName }
+        if ($intentName -eq "") { $intentName = Find-ScalarProp $sug @("intent", "intentName") }
 
         # When was the article surfaced - needed to line up with the transcript
-        if ($sug.dateCreated)      { $sugTime = [string]$sug.dateCreated }
-        elseif ($sug.timestamp)    { $sugTime = [string]$sug.timestamp }
-        elseif ($sug.dateModified) { $sugTime = [string]$sug.dateModified }
+        $sugTime = Find-ScalarProp $sug @("dateCreated", "timestamp", "dateModified", "dateStart")
 
-        # Knowledge article payload - schema-defensive extraction
-        $k = $null
-        if ($sug.knowledgeArticleSuggestion) { $k = $sug.knowledgeArticleSuggestion }
-        elseif ($sug.knowledgeSearchSuggestion) { $k = $sug.knowledgeSearchSuggestion }
-        elseif ($sug.knowledge) { $k = $sug.knowledge }
-
-        if ($k) {
-            if ($k.knowledgeBase -and $k.knowledgeBase.id) { $kbId = [string]$k.knowledgeBase.id }
-            elseif ($k.knowledgeBaseId) { $kbId = [string]$k.knowledgeBaseId }
-
-            if ($k.document -and $k.document.id) { $docId = [string]$k.document.id }
-            elseif ($k.documentId) { $docId = [string]$k.documentId }
-
-            if ($k.document -and $k.document.version) { $docVersion = [string]$k.document.version }
-
-            if ($k.document -and $k.document.title) { $title = [string]$k.document.title }
-            elseif ($k.title) { $title = [string]$k.title }
-
-            # The search query Copilot generated FROM the conversation = the "why"
-            if ($k.query) { $utterance = [string]$k.query }
-            if ($utterance -eq "" -and $k.searchQuery) { $utterance = [string]$k.searchQuery }
+        # Knowledge identifiers - wherever they are nested
+        $kbId = Find-ScalarProp $sug @("knowledgeBaseId")
+        if ($kbId -eq "") {
+            $kbObj = Find-ObjectProp $sug "knowledgeBase"
+            if ($kbObj) { $kbId = Find-ScalarProp $kbObj @("id") }
         }
 
-        # Triggering utterance / message that caused the suggestion (best effort)
-        if ($utterance -eq "" -and $sug.triggeringMessage -and $sug.triggeringMessage.text) {
-            $utterance = [string]$sug.triggeringMessage.text
+        $docId = Find-ScalarProp $sug @("documentId")
+        $docObj = Find-ObjectProp $sug "document"
+        if ($docId -eq "" -and $docObj) { $docId = Find-ScalarProp $docObj @("id") }
+        if ($docObj) {
+            $docVersion = Find-ScalarProp $docObj @("version", "versionId")
+            $title      = Find-ScalarProp $docObj @("title")
         }
-        if ($utterance -eq "" -and $sug.utterance) { $utterance = [string]$sug.utterance }
-        if ($utterance -eq "" -and $sug.query)     { $utterance = [string]$sug.query }
+        if ($title -eq "") {
+            $artObj = Find-ObjectProp $sug "article"
+            if ($artObj) {
+                $title = Find-ScalarProp $artObj @("title")
+                if ($docId -eq "") { $docId = Find-ScalarProp $artObj @("documentId", "id") }
+                if ($docVersion -eq "") { $docVersion = Find-ScalarProp $artObj @("versionId", "version") }
+            }
+        }
+        if ($title -eq "") { $title = Find-ScalarProp $sug @("title") }
+
+        # The phrase / search query that caused the suggestion = the "why"
+        $utterance = Find-ScalarProp $sug @("query", "searchQuery", "utterance", "transcriptionText")
+        if ($utterance -eq "" -and $trigObj) {
+            $utterance = Find-ScalarProp $trigObj @("text", "message", "phrase")
+        }
 
         # Title fallback via Knowledge API (cached per document)
         if ($title -eq "" -and $kbId -ne "" -and $docId -ne "") {
@@ -544,6 +608,7 @@ foreach ($c in $conversationList) {
         foreach ($m in $matches) {
             $t = $m.ArticleTitle
             if ($t -eq "") { $t = $m.DocumentId }
+            if ($t -eq "") { $t = "(unidentified " + $m.SuggestionType + " suggestion " + $m.SuggestionId + ")" }
             if ($titles -notcontains $t) { $titles += $t }
 
             $why = ""
