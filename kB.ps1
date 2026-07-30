@@ -560,12 +560,26 @@ foreach ($conv in $conversationList) {
         # Confidence can sit at top level, inside the trigger, or inside the article payload
         $confidence = Find-ScalarProp $sug @("confidence")
 
-        # WHY was it presented - the detected intent that fired the Copilot rule.
-        # Search the trigger subtree first (most specific), then the whole object.
+        # WHY was it presented - the trigger that fired the Copilot rule.
+        # trigger.type tells us what trigger.value means:
+        #   type like "Intent"    -> value is the detected intent NAME
+        #   type like "Utterance" -> value is the spoken/typed TEXT itself
+        # (The old code shoved value into the intent column regardless - that
+        #  is why TriggeringText came out empty for utterance triggers.)
         $intentName = ""
+        $trigTime   = ""
         $trigObj = Find-ObjectProp $sug "trigger"
         if ($trigObj) {
-            $intentName = Find-ScalarProp $trigObj @("intent", "intentName", "name", "value")
+            $trigType  = Find-ScalarProp $trigObj @("type")
+            $trigValue = Find-ScalarProp $trigObj @("value")
+            $trigTime  = Find-ScalarProp $trigObj @("eventTime", "dateCreated", "timestamp")
+            if ($trigType -like "*ntent*") {
+                $intentName = $trigValue
+            }
+            elseif ($trigValue -ne "") {
+                $utterance = $trigValue
+            }
+            if ($intentName -eq "") { $intentName = Find-ScalarProp $trigObj @("intent", "intentName", "name") }
         }
         if ($intentName -eq "") { $intentName = Find-ScalarProp $sug @("intent", "intentName") }
 
@@ -597,10 +611,14 @@ foreach ($conv in $conversationList) {
         if ($title -eq "") { $title = Find-ScalarProp $sug @("title") }
 
         # The phrase / search query that caused the suggestion = the "why"
-        $utterance = Find-ScalarProp $sug @("query", "searchQuery", "utterance", "transcriptionText")
-        if ($utterance -eq "" -and $trigObj) {
-            $utterance = Find-ScalarProp $trigObj @("text", "message", "phrase")
+        if ($utterance -eq "") {
+            $utterance = Find-ScalarProp $sug @("query", "searchQuery", "utterance", "transcriptionText")
         }
+        if ($utterance -eq "" -and $trigObj) {
+            $utterance = Find-ScalarProp $trigObj @("text", "message", "phrase", "utterance")
+        }
+        $utteranceSource = ""
+        if ($utterance -ne "") { $utteranceSource = "copilot-api" }
 
         # Title fallback via Knowledge API (cached per document)
         if ($title -eq "" -and $kbId -ne "" -and $docId -ne "") {
@@ -625,6 +643,7 @@ foreach ($conv in $conversationList) {
             SuggestionId      = [string]$sug.id
             SuggestionType    = $sugType
             SuggestedAtUtc    = $sugTime
+            TriggerTimeUtc    = $trigTime
             State             = $state
             Confidence        = $confidence
             TriggerIntent     = $intentName
@@ -633,6 +652,7 @@ foreach ($conv in $conversationList) {
             DocumentVersion   = $docVersion
             ArticleTitle      = $title
             TriggeringText    = $utterance
+            TriggerTextSource = $utteranceSource
         }
     }
 }
@@ -677,6 +697,7 @@ Write-Host ("Transcript scope: " + $transcriptConvIds.Keys.Count + " conversatio
 
 $transcriptRows = @()     # one row per phrase (for the transcript CSV)
 $convTranscripts = @{}    # conversationId -> single joined text block (for the overview CSV)
+$convPhrases = @{}        # conversationId -> phrase objects with parsed times (for trigger-text backfill)
 $epochBase = [datetime]"1970-01-01T00:00:00Z"
 
 foreach ($c in $conversationList) {
@@ -715,6 +736,7 @@ foreach ($c in $conversationList) {
     elseif ($tdoc.phrases) { $tsets = @($tdoc) }
 
     $joined = ""
+    $phraseObjs = @()
     foreach ($tset in $tsets) {
         $phrases = @()
         if ($tset.phrases) { $phrases = @($tset.phrases) }
@@ -730,6 +752,7 @@ foreach ($c in $conversationList) {
 
             # startTimeMs may be epoch milliseconds (absolute) or an offset
             $phTimeUtc = ""
+            $parsedTime = $null
             $rawMs = 0
             $gotMs = $false
             try {
@@ -737,9 +760,13 @@ foreach ($c in $conversationList) {
             } catch { $gotMs = $false }
             if ($gotMs) {
                 if ($rawMs -gt 1000000000000) {
-                    # epoch ms -> UTC datetime via instance method (CLM-safe)
+                    # epoch ms -> UTC datetime via instance methods (CLM-safe).
+                    # The [datetime]"...Z" cast converts to LOCAL time, so
+                    # normalise back to true UTC to match the API's UTC strings.
                     $dt = $epochBase.AddMilliseconds($rawMs)
+                    $dt = $dt.ToUniversalTime()
                     $phTimeUtc = $dt.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
+                    $parsedTime = $dt
                 }
                 else {
                     # offset ms from start of communication
@@ -754,9 +781,19 @@ foreach ($c in $conversationList) {
                 Text           = $text
             }
 
+            $phraseObjs += New-Object PSObject -Property @{
+                ParsedTime = $parsedTime
+                Speaker    = $speaker
+                Text       = $text
+            }
+
             if ($joined -ne "") { $joined = $joined + "`n" }
             $joined = $joined + "[" + $speaker + "] " + $text
         }
+    }
+
+    if ($phraseObjs.Count -gt 0) {
+        $convPhrases[$c.ConversationId] = $phraseObjs
     }
 
     if ($joined -ne "") {
@@ -770,6 +807,72 @@ foreach ($c in $conversationList) {
 Write-Host ("Transcripts retrieved for " + $convTranscripts.Keys.Count + " conversation(s), " + $transcriptRows.Count + " phrases total.") -ForegroundColor Green
 if ($transcriptConvIds.Keys.Count -gt 0 -and $convTranscripts.Keys.Count -eq 0) {
     Write-Host "No transcripts retrieved. Check 'speechAndTextAnalytics > data > view' permission and that voice transcription / digital transcripts are enabled for these queues." -ForegroundColor Yellow
+}
+
+# =============================================================================
+# 4b. BACKFILL TriggeringText FROM THE TRANSCRIPT
+#     The Copilot suggestions API frequently returns only an intent reference
+#     in the trigger - not the spoken/typed text. When TriggeringText is
+#     empty, derive it: the customer phrases spoken just BEFORE the suggestion
+#     fired are what triggered the article.
+# =============================================================================
+$backfilled = 0
+foreach ($d in $detailRows) {
+    if ($d.TriggeringText -ne "") { continue }
+    if (-not $convPhrases.ContainsKey($d.ConversationId)) { continue }
+
+    # Customer-side phrases only - those are what Copilot listens to
+    $custPhrases = @()
+    foreach ($ph in $convPhrases[$d.ConversationId]) {
+        if ($ph.Speaker -eq "customer" -or $ph.Speaker -eq "external") { $custPhrases += $ph }
+    }
+    if ($custPhrases.Count -eq 0) { continue }
+
+    # Reference time: trigger eventTime if present, else when the suggestion was
+    # created. Normalised to UTC so it compares correctly with phrase times.
+    $refTime = $null
+    $refStr = [string]$d.TriggerTimeUtc
+    if ($refStr -eq "") { $refStr = [string]$d.SuggestedAtUtc }
+    if ($refStr -match "^[0-9]{12,}$") {
+        # epoch milliseconds delivered as a bare number
+        try {
+            $refTime = $epochBase.AddMilliseconds([double]$refStr)
+            $refTime = $refTime.ToUniversalTime()
+        } catch { $refTime = $null }
+    }
+    elseif ($refStr -ne "") {
+        try {
+            $refTime = [datetime]$refStr
+            $refTime = $refTime.ToUniversalTime()
+        } catch { $refTime = $null }
+    }
+
+    $picked = @()
+    if ($null -ne $refTime) {
+        # Last 2 timestamped customer phrases at/before the suggestion moment
+        foreach ($ph in $custPhrases) {
+            if ($null -ne $ph.ParsedTime -and $ph.ParsedTime -le $refTime) { $picked += $ph.Text }
+        }
+        if ($picked.Count -gt 2) {
+            $picked = @($picked[($picked.Count - 2)], $picked[($picked.Count - 1)])
+        }
+    }
+    if ($picked.Count -eq 0) {
+        # No usable timestamps (e.g. offset-only digital transcripts) - fall back
+        # to the customer's opening phrases, the usual reason for contact
+        $take = 2
+        if ($custPhrases.Count -lt $take) { $take = $custPhrases.Count }
+        for ($k = 0; $k -lt $take; $k++) { $picked += $custPhrases[$k].Text }
+    }
+
+    if ($picked.Count -gt 0) {
+        $d.TriggeringText    = ($picked -join " ")
+        $d.TriggerTextSource = "transcript-derived"
+        $backfilled++
+    }
+}
+if ($backfilled -gt 0) {
+    Write-Host ("TriggeringText backfilled from transcripts for " + $backfilled + " suggestion row(s).") -ForegroundColor Green
 }
 
 # =============================================================================
@@ -860,6 +963,7 @@ foreach ($d in $detailRows) {
         SuggestionId      = $d.SuggestionId
         SuggestionType    = $d.SuggestionType
         SuggestedAtUtc    = $d.SuggestedAtUtc
+        TriggerTimeUtc    = $d.TriggerTimeUtc
         State             = $d.State
         Confidence        = $d.Confidence
         TriggerIntent     = $d.TriggerIntent
@@ -868,11 +972,12 @@ foreach ($d in $detailRows) {
         DocumentVersion   = $d.DocumentVersion
         ArticleTitle      = $d.ArticleTitle
         TriggeringText    = $d.TriggeringText
+        TriggerTextSource = $d.TriggerTextSource
     }
 }
 
 $detailOut |
-    Select-Object ConversationId, ConversationStart, Agent, Queue, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, State, Confidence, TriggerIntent, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText |
+    Select-Object ConversationId, ConversationStart, Agent, Queue, MediaType, SuggestionId, SuggestionType, SuggestedAtUtc, TriggerTimeUtc, State, Confidence, TriggerIntent, KnowledgeBaseId, DocumentId, DocumentVersion, ArticleTitle, TriggeringText, TriggerTextSource |
     Export-Csv -Path $DetailCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ("Detail CSV written: " + $DetailCsv) -ForegroundColor Green
